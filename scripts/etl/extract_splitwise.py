@@ -25,10 +25,11 @@ from ..utils.splitwise_client import get_splitwise_client
 LOGGER = logging.getLogger(__name__)
 LOGGER.addHandler(logging.NullHandler())
 
+
 @dataclass
 class ETLConfig:
     """Configuration for ETL process."""
-    batch_size: int = 100
+    batch_size: int = 1000
     max_retries: int = 3
     incremental_mode: bool = True
     validate_data: bool = True
@@ -38,7 +39,7 @@ class ETLConfig:
 def load_config() -> ETLConfig:
     """Load configuration from environment variables."""
     return ETLConfig(
-        batch_size=int(os.getenv('ETL_BATCH_SIZE', 100)),
+        batch_size=int(os.getenv('ETL_BATCH_SIZE', 1000)),
         max_retries=int(os.getenv('ETL_MAX_RETRIES', 3)),
         incremental_mode=os.getenv('ETL_INCREMENTAL', 'true').lower() == 'true',
         validate_data=os.getenv('ETL_VALIDATE', 'true').lower() == 'true',
@@ -51,11 +52,11 @@ def _resolve_paths() -> Dict[str, Path]:
     Determine project-root-relative paths for the DuckDB file and the
     create_raw_tables.sql schema, based on this module's location.
     """
-    scripts_dir   = Path(__file__).resolve().parent       # .../scripts/etl
-    project_root  = scripts_dir.parent.parent             # BUDGET_DUCK
+    scripts_dir     = Path(__file__).resolve().parent       # .../scripts/etl
+    project_root    = scripts_dir.parent.parent             # BUDGET_DUCK
     return {
-        "db_path":        project_root / "db_files" / "budget.duckdb",
-        "schema_sql":     project_root / "sql" / "schema" / "create_raw_tables.sql",
+        "db_path":      project_root / "db_files" / "budget.duckdb",
+        "schema_sql":   project_root / "sql" / "schema" / "create_raw_tables.sql",
     }
 
 
@@ -126,7 +127,7 @@ def normalize_user_data(users) -> List[Dict]:
     
     return normalized_users
 
-    
+
 def normalize_expense_record(exp) -> Dict:
     """Normalize a single expense record with improved error handling."""
     try:
@@ -142,7 +143,7 @@ def normalize_expense_record(exp) -> Dict:
             "updated_at": exp.getUpdatedAt(),
             "created_at": exp.getCreatedAt(),
             "is_payment": bool(exp.getPayment()),
-            "users_json": json.dumps(users),
+            "users_json": json.dumps(users, ensure_ascii=False),
             "category_id": exp.getCategory().getId() if exp.getCategory() else None,
             "category_name": exp.getCategory().getName() if exp.getCategory() else None,
             "version_start": exp.getUpdatedAt(),
@@ -217,7 +218,7 @@ def handle_updated_records(conn, new_records: List[Dict]) -> None:
     LOGGER.info("Closed out %d old record versions", rows_updated)
 
 
-def batch_insert_records(conn, records: List[Dict], batch_size: int = 100) -> None:
+def batch_insert_records(conn, records: List[Dict], batch_size: int = 1000) -> None:
     """Insert records in batches to avoid memory issues."""
     if not records:
         LOGGER.info("No records to insert")
@@ -272,8 +273,9 @@ def apply_schema_and_insert_incremental(
     conn = duckdb.connect(str(db_path))
     
     try:
-        # Apply schema
-        conn.execute(schema_sql_path.read_text())
+        # Apply schema - let Python handle encoding automatically
+        schema_sql = schema_sql_path.read_text(encoding='utf-8')
+        conn.execute(schema_sql)
         
         if not records:
             LOGGER.info("No records to process")
@@ -390,3 +392,13 @@ def extract_splitwise(
     except Exception as e:
         LOGGER.error("Extraction failed: %s", e)
         raise
+
+
+# Backward compatibility - fix the typo in the original function name
+def exract_splitwise(user: str, group_id: int) -> None:
+    """
+    Legacy function name for backward compatibility.
+    Redirects to the corrected extract_splitwise function.
+    """
+    LOGGER.warning("Function 'exract_splitwise' is deprecated. Use 'extract_splitwise' instead.")
+    extract_splitwise(user, group_id, full_refresh=True)
