@@ -28,6 +28,7 @@ data/external/
 
 # ===== PYTHON =====
 # Byte-compiled / optimized / DLL files
+.venv/
 __pycache__/
 **/__pycache__/
 *.py[cod]
