@@ -23,6 +23,8 @@ db_files/
 data/raw/
 data/processed/
 data/external/
+sql/.dbeaver/
+sql/.project
 # But keep the directory structure
 !db_files/.gitkeep
 
