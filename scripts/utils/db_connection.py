@@ -40,10 +40,6 @@ class DuckDBManager:
                     conn = duckdb.connect(self.db_path, read_only=True)
                 else:
                     conn = duckdb.connect(self.db_path)
-                    # Enable WAL mode for better concurrent access
-                    conn.execute("PRAGMA wal_mode=ON")
-                    # Set busy timeout for locked database
-                    conn.execute("PRAGMA busy_timeout=30000")  # 30 seconds
                 
                 LOGGER.debug("Connected to DuckDB (attempt %d, read_only=%s)", attempt + 1, read_only)
                 yield conn
@@ -80,10 +76,15 @@ class DuckDBManager:
     def execute_script(self, script: str):
         """Execute a SQL script (multiple statements)."""
         with self.get_connection() as conn:
-            # Split script into individual statements
+            # Split script into individual statements and filter out empty ones
             statements = [stmt.strip() for stmt in script.split(';') if stmt.strip()]
             for statement in statements:
-                conn.execute(statement)
+                try:
+                    conn.execute(statement)
+                except Exception as e:
+                    LOGGER.error("Failed to execute statement: %s", statement[:100])
+                    LOGGER.error("Error: %s", e)
+                    raise
     
     def table_exists(self, schema: str, table: str) -> bool:
         """Check if a table exists."""
