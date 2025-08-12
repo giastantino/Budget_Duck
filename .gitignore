@@ -14,16 +14,22 @@ config/local/
 
 
 # ===== DATABASE FILES =====
-db_files/*.duckdb*
-db_files/*.db*
-db_files/*.sqlite*
+*.db
+*.sqlite
+*.sqlite3
+*.duckdb
+*.duckdb.wal
+db_files/
+data/raw/
+data/processed/
+data/external/
 # But keep the directory structure
 !db_files/.gitkeep
-
 
 # ===== PYTHON =====
 # Byte-compiled / optimized / DLL files
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 *.so
@@ -32,8 +38,7 @@ __pycache__/
 # Log files
 *.log
 logs/
-log/
-*.log.*
+etl.log
 
 # DBT specific (for future use)
 dbt_packages/
