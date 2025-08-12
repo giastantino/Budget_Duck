@@ -21,6 +21,7 @@ from splitwise import Splitwise
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from ..utils.splitwise_client import get_splitwise_client
+from ..utils.db_connection import get_db_connection, get_db_manager
 
 LOGGER = logging.getLogger(__name__)
 LOGGER.addHandler(logging.NullHandler())
@@ -63,13 +64,18 @@ def _resolve_paths() -> Dict[str, Path]:
 def get_last_update_timestamp(db_path: Path, group_id: int) -> Optional[str]:
     """Get the most recent updated_at timestamp for incremental loading."""
     try:
-        conn = duckdb.connect(str(db_path))
-        result = conn.execute(
+        db_manager = get_db_manager(db_path)
+        
+        if not db_manager.table_exists('raw', 'transactions'):
+            LOGGER.info("Table raw.transactions does not exist yet")
+            return None
+            
+        result = db_manager.execute_query(
             "SELECT MAX(updated_at) FROM raw.transactions WHERE group_id = ? AND is_current = true",
-            [group_id]
-        ).fetchone()
-        conn.close()
-        return result[0] if result and result[0] else None
+            [group_id],
+            read_only=True
+        )
+        return result[0][0] if result and result[0] and result[0][0] else None
     except Exception as e:
         LOGGER.warning("Could not get last update timestamp: %s", e)
         return None
@@ -196,29 +202,27 @@ def validate_expense_record(record: Dict) -> bool:
     return True
 
 
-def handle_updated_records(conn, new_records: List[Dict]) -> None:
+def handle_updated_records(transaction_ids: List, db_path: Path) -> None:
     """Handle SCD Type 2 updates for changed records."""
-    if not new_records:
+    if not transaction_ids:
         return
-        
-    transaction_ids = [r['transaction_id'] for r in new_records]
     
     LOGGER.info("Closing out old versions for %d transactions", len(transaction_ids))
     
-    # Close out old versions of updated records
-    placeholders = ','.join(['?' for _ in transaction_ids])
-    update_query = f"""
-        UPDATE raw.transactions 
-        SET is_current = false, version_end = CURRENT_TIMESTAMP
-        WHERE transaction_id IN ({placeholders})
-        AND is_current = true
-    """
-    
-    rows_updated = conn.execute(update_query, transaction_ids).rowcount
-    LOGGER.info("Closed out %d old record versions", rows_updated)
+    with get_db_connection() as conn:
+        placeholders = ','.join(['?' for _ in transaction_ids])
+        update_query = f"""
+            UPDATE raw.transactions 
+            SET is_current = false, version_end = CURRENT_TIMESTAMP
+            WHERE transaction_id IN ({placeholders})
+            AND is_current = true
+        """
+        
+        rows_updated = conn.execute(update_query, transaction_ids).rowcount
+        LOGGER.info("Closed out %d old record versions", rows_updated)
 
 
-def batch_insert_records(conn, records: List[Dict], batch_size: int = 1000) -> None:
+def batch_insert_records(records: List[Dict], batch_size: int = 1000) -> None:
     """Insert records in batches to avoid memory issues."""
     if not records:
         LOGGER.info("No records to insert")
@@ -226,36 +230,37 @@ def batch_insert_records(conn, records: List[Dict], batch_size: int = 1000) -> N
         
     total_inserted = 0
     
-    for i in range(0, len(records), batch_size):
-        batch = records[i:i + batch_size]
-        df = pd.DataFrame(batch)
-        
-        # Register the batch as a temporary table
-        batch_name = f"tmp_batch_{i}"
-        conn.register(batch_name, df)
-        
-        # Insert the batch
-        insert_query = f"""
-            INSERT INTO raw.transactions (
-                transaction_id, group_id, date, cost, currency_code,
-                description, updated_at, created_at, is_payment,
-                category_id, category_name, users_json,
-                version_start, version_end, is_current
-            )
-            SELECT
-                transaction_id, group_id, date, cost, currency_code,
-                description, updated_at, created_at, is_payment,
-                category_id, category_name, users_json,
-                version_start, version_end, is_current
-            FROM {batch_name}
-        """
-        
-        conn.execute(insert_query)
-        batch_inserted = len(batch)
-        total_inserted += batch_inserted
-        
-        LOGGER.info("Inserted batch %d-%d (%d records)", 
-                   i + 1, min(i + batch_size, len(records)), batch_inserted)
+    with get_db_connection() as conn:
+        for i in range(0, len(records), batch_size):
+            batch = records[i:i + batch_size]
+            df = pd.DataFrame(batch)
+            
+            # Register the batch as a temporary table
+            batch_name = f"tmp_batch_{i}"
+            conn.register(batch_name, df)
+            
+            # Insert the batch
+            insert_query = f"""
+                INSERT INTO raw.transactions (
+                    transaction_id, group_id, date, cost, currency_code,
+                    description, updated_at, created_at, is_payment,
+                    category_id, category_name, users_json,
+                    version_start, version_end, is_current
+                )
+                SELECT
+                    transaction_id, group_id, date, cost, currency_code,
+                    description, updated_at, created_at, is_payment,
+                    category_id, category_name, users_json,
+                    version_start, version_end, is_current
+                FROM {batch_name}
+            """
+            
+            conn.execute(insert_query)
+            batch_inserted = len(batch)
+            total_inserted += batch_inserted
+            
+            LOGGER.info("Inserted batch %d-%d (%d records)", 
+                       i + 1, min(i + batch_size, len(records)), batch_inserted)
     
     LOGGER.info("Total inserted: %d records", total_inserted)
 
@@ -270,28 +275,22 @@ def apply_schema_and_insert_incremental(
     schema_sql_path = paths["schema_sql"]
     
     LOGGER.info("Connecting to DuckDB at %s", db_path)
-    conn = duckdb.connect(str(db_path))
     
-    try:
-        # Apply schema - let Python handle encoding automatically
-        schema_sql = schema_sql_path.read_text(encoding='utf-8')
-        conn.execute(schema_sql)
-        
-        if not records:
-            LOGGER.info("No records to process")
-            return
-        
-        # Handle SCD Type 2 updates
-        handle_updated_records(conn, records)
-        
-        # Insert new records in batches
-        batch_insert_records(conn, records, config.batch_size)
-        
-    except Exception as e:
-        LOGGER.error("Error during database operations: %s", e)
-        raise
-    finally:
-        conn.close()
+    # Apply schema using connection manager
+    db_manager = get_db_manager(db_path)
+    schema_sql = schema_sql_path.read_text(encoding='utf-8')
+    db_manager.execute_script(schema_sql)
+    
+    if not records:
+        LOGGER.info("No records to process")
+        return
+    
+    # Handle SCD Type 2 updates
+    transaction_ids = [r['transaction_id'] for r in records]
+    handle_updated_records(transaction_ids, db_path)
+    
+    # Insert new records in batches
+    batch_insert_records(records, config.batch_size)
 
 
 def fetch_and_normalize_expenses(
@@ -392,13 +391,3 @@ def extract_splitwise(
     except Exception as e:
         LOGGER.error("Extraction failed: %s", e)
         raise
-
-
-# Backward compatibility - fix the typo in the original function name
-def exract_splitwise(user: str, group_id: int) -> None:
-    """
-    Legacy function name for backward compatibility.
-    Redirects to the corrected extract_splitwise function.
-    """
-    LOGGER.warning("Function 'exract_splitwise' is deprecated. Use 'extract_splitwise' instead.")
-    extract_splitwise(user, group_id, full_refresh=True)
