@@ -105,6 +105,27 @@ def fetch_expenses_with_retry(
         LOGGER.error("Unexpected error fetching expenses: %s", e)
         raise
 
+
+def normalize_user_data(users) -> List[Dict]:
+    """Extract and normalize user data with better error handling."""
+    normalized_users = []
+    
+    for user in (users or []):
+        try:
+            user_data = {
+                "user_id": user.getFirstName(),
+                "user_last_name": getattr(user, 'getLastName', lambda: None)(),
+                "owed_share": float(user.getOwedShare() or 0),
+                "paid_share": float(user.getPaidShare() or 0),
+                "net_balance": float(user.getNetBalance() or 0),
+            }
+            normalized_users.append(user_data)
+        except (AttributeError, ValueError) as e:
+            LOGGER.warning("Failed to normalize user data: %s", e)
+            continue
+    
+    return normalized_users
+
     
 def normalize_expense_record(exp) -> Dict:
     """Normalize a single expense record with improved error handling."""
