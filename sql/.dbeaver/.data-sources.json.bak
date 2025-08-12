@@ -1,0 +1,35 @@
+{
+	"folders": {},
+	"connections": {
+		"duckdb_jdbc-1979ee31dcd-45dc29ce18d44699": {
+			"provider": "generic",
+			"driver": "duckdb_jdbc",
+			"name": "budget.duckdb",
+			"save-password": true,
+			"configuration": {
+				"database": "C:\\Users\\Giastantino\\PythonProjects\\Budget_Duck\\duckdb\\budget.duckdb",
+				"url": "jdbc:duckdb:C:\\Users\\Giastantino\\PythonProjects\\Budget_Duck\\duckdb\\budget.duckdb",
+				"configurationType": "MANUAL",
+				"type": "dev",
+				"closeIdleConnection": true,
+				"auth-model": "native"
+			}
+		}
+	},
+	"connection-types": {
+		"dev": {
+			"name": "Development",
+			"color": "255,255,255",
+			"description": "Regular development database",
+			"auto-commit": true,
+			"confirm-execute": false,
+			"confirm-data-change": false,
+			"smart-commit": false,
+			"smart-commit-recover": true,
+			"auto-close-transactions": true,
+			"close-transactions-period": 1800,
+			"auto-close-connections": true,
+			"close-connections-period": 14400
+		}
+	}
+}
