@@ -366,11 +366,35 @@ def batch_insert_user_payments(records: List[Dict], batch_size: int = 1000) -> N
     LOGGER.info("Total user payment records inserted: %d", total_inserted)
 
 
+def clear_existing_data(group_id: int, db_path: Path) -> None:
+    """Clear existing data for a group during full refresh."""
+    LOGGER.info("Clearing existing data for group_id=%s", group_id)
+    
+    with get_db_connection() as conn:
+        # Delete from user_payments first (foreign key considerations)
+        delete_payments_query = """
+            DELETE FROM raw.user_payments 
+            WHERE transaction_id IN (
+                SELECT transaction_id FROM raw.transactions WHERE group_id = ?
+            )
+        """
+        payments_deleted = conn.execute(delete_payments_query, [group_id]).rowcount
+        
+        # Delete from transactions
+        delete_transactions_query = "DELETE FROM raw.transactions WHERE group_id = ?"
+        transactions_deleted = conn.execute(delete_transactions_query, [group_id]).rowcount
+        
+        LOGGER.info("Cleared %d transaction records and %d user payment records", 
+                   transactions_deleted, payments_deleted)
+
+
 def apply_schema_and_insert_incremental(
     paths: Dict[str, Path],
     transaction_records: List[Dict],
     user_payment_records: List[Dict],
-    config: ETLConfig
+    config: ETLConfig,
+    full_refresh: bool = False,
+    group_id: int = None
 ) -> None:
     """Apply DDL and bulk-insert records with SCD Type 2 handling."""
     db_path = paths["db_path"]
@@ -387,14 +411,18 @@ def apply_schema_and_insert_incremental(
         LOGGER.info("No records to process")
         return
     
-    # Handle SCD Type 2 updates
-    if transaction_records:
+    # Handle full refresh by clearing existing data
+    if full_refresh and group_id:
+        clear_existing_data(group_id, db_path)
+    
+    # Handle SCD Type 2 updates (only for incremental loads)
+    if not full_refresh and transaction_records:
         transaction_ids = [r['transaction_id'] for r in transaction_records]
         handle_updated_records(transaction_ids, db_path)
-        
-        # Insert new records in batches
-        batch_insert_transactions(transaction_records, config.batch_size)
-        batch_insert_user_payments(user_payment_records, config.batch_size)
+    
+    # Insert new records in batches
+    batch_insert_transactions(transaction_records, config.batch_size)
+    batch_insert_user_payments(user_payment_records, config.batch_size)
 
 
 def fetch_and_normalize_expenses(
@@ -511,7 +539,9 @@ def extract_splitwise(
             return
         
         # Load with SCD Type 2 handling
-        apply_schema_and_insert_incremental(paths, transaction_records, user_payment_records, config)
+        apply_schema_and_insert_incremental(
+            paths, transaction_records, user_payment_records, config, full_refresh, group_id
+        )
         
         LOGGER.info("Extraction completed successfully. Processed %d transactions and %d user payments", 
                    len(transaction_records), len(user_payment_records))
