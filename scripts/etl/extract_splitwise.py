@@ -12,7 +12,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import duckdb
 import pandas as pd
@@ -134,35 +134,62 @@ def normalize_user_data(users) -> List[Dict]:
     return normalized_users
 
 
-def normalize_expense_record(exp) -> Dict:
-    """Normalize a single expense record with improved error handling."""
+def normalize_expense_record(exp) -> Tuple[Dict, List[Dict]]:
+    """
+    Normalize a single expense record into transaction and user payment records.
+    
+    Returns:
+        Tuple of (transaction_record, user_payment_records)
+    """
     try:
-        users = normalize_user_data(exp.getUsers())
+        updated_at = exp.getUpdatedAt()
+        transaction_id = exp.getId()
         
-        return {
-            "transaction_id": exp.getId(),
+        # Create the transaction record
+        transaction_record = {
+            "transaction_id": transaction_id,
             "group_id": exp.getGroupId(),
             "date": exp.getDate(),
             "cost": float(exp.getCost() or 0),
             "currency_code": exp.getCurrencyCode(),
             "description": exp.getDescription() or "",
-            "updated_at": exp.getUpdatedAt(),
+            "updated_at": updated_at,
             "created_at": exp.getCreatedAt(),
             "is_payment": bool(exp.getPayment()),
-            "users_json": json.dumps(users, ensure_ascii=False),
             "category_id": exp.getCategory().getId() if exp.getCategory() else None,
             "category_name": exp.getCategory().getName() if exp.getCategory() else None,
-            "version_start": exp.getUpdatedAt(),
+            "version_start": updated_at,
             "version_end": None,
             "is_current": True,
         }
+        
+        # Create user payment records
+        users = normalize_user_data(exp.getUsers())
+        user_payment_records = []
+        
+        for user in users:
+            user_payment_record = {
+                "transaction_id": transaction_id,
+                "user_id": user["user_id"],
+                "user_last_name": user["user_last_name"],
+                "owed_share": user["owed_share"],
+                "paid_share": user["paid_share"],
+                "net_balance": user["net_balance"],
+                "version_start": updated_at,
+                "version_end": None,
+                "is_current": True,
+            }
+            user_payment_records.append(user_payment_record)
+        
+        return transaction_record, user_payment_records
+        
     except Exception as e:
         LOGGER.error("Failed to normalize expense %s: %s", getattr(exp, 'getId', lambda: 'unknown')(), e)
         raise
 
 
-def validate_expense_record(record: Dict) -> bool:
-    """Validate required fields and data types."""
+def validate_transaction_record(record: Dict) -> bool:
+    """Validate transaction record required fields and data types."""
     required_fields = ['transaction_id', 'group_id', 'date', 'cost']
     
     # Check required fields
@@ -191,19 +218,39 @@ def validate_expense_record(record: Dict) -> bool:
         LOGGER.warning("Invalid cost value for transaction %s", record['transaction_id'])
         return False
     
-    # Validate JSON structure
-    try:
-        if record.get('users_json'):
-            json.loads(record['users_json'])
-    except json.JSONDecodeError:
-        LOGGER.warning("Invalid JSON in users_json for transaction %s", record['transaction_id'])
+    return True
+
+
+def validate_user_payment_record(record: Dict) -> bool:
+    """Validate user payment record required fields and data types."""
+    required_fields = ['transaction_id', 'user_id']
+    
+    # Check required fields
+    missing_fields = [field for field in required_fields if field not in record or record[field] is None]
+    if missing_fields:
+        LOGGER.warning("Missing required fields %s in user payment for transaction %s", 
+                      missing_fields, record.get('transaction_id', 'unknown'))
         return False
+    
+    # Validate user_id is not empty
+    if not str(record['user_id']).strip():
+        LOGGER.warning("Empty user_id for transaction %s", record.get('transaction_id', 'unknown'))
+        return False
+    
+    # Validate monetary fields
+    for field in ['owed_share', 'paid_share', 'net_balance']:
+        try:
+            float(record.get(field, 0))
+        except (ValueError, TypeError):
+            LOGGER.warning("Invalid %s value for user %s in transaction %s", 
+                          field, record.get('user_id'), record.get('transaction_id'))
+            return False
     
     return True
 
 
 def handle_updated_records(transaction_ids: List, db_path: Path) -> None:
-    """Handle SCD Type 2 updates for changed records."""
+    """Handle SCD Type 2 updates for changed records in both tables."""
     if not transaction_ids:
         return
     
@@ -211,21 +258,34 @@ def handle_updated_records(transaction_ids: List, db_path: Path) -> None:
     
     with get_db_connection() as conn:
         placeholders = ','.join(['?' for _ in transaction_ids])
-        update_query = f"""
+        
+        # Update transactions table
+        update_transactions_query = f"""
             UPDATE raw.transactions 
             SET is_current = false, version_end = CURRENT_TIMESTAMP
             WHERE transaction_id IN ({placeholders})
             AND is_current = true
         """
         
-        rows_updated = conn.execute(update_query, transaction_ids).rowcount
-        LOGGER.info("Closed out %d old record versions", rows_updated)
+        # Update user_payments table
+        update_payments_query = f"""
+            UPDATE raw.user_payments 
+            SET is_current = false, version_end = CURRENT_TIMESTAMP
+            WHERE transaction_id IN ({placeholders})
+            AND is_current = true
+        """
+        
+        transactions_updated = conn.execute(update_transactions_query, transaction_ids).rowcount
+        payments_updated = conn.execute(update_payments_query, transaction_ids).rowcount
+        
+        LOGGER.info("Closed out %d transaction records and %d user payment records", 
+                   transactions_updated, payments_updated)
 
 
-def batch_insert_records(records: List[Dict], batch_size: int = 1000) -> None:
-    """Insert records in batches to avoid memory issues."""
+def batch_insert_transactions(records: List[Dict], batch_size: int = 1000) -> None:
+    """Insert transaction records in batches."""
     if not records:
-        LOGGER.info("No records to insert")
+        LOGGER.info("No transaction records to insert")
         return
         
     total_inserted = 0
@@ -236,7 +296,7 @@ def batch_insert_records(records: List[Dict], batch_size: int = 1000) -> None:
             df = pd.DataFrame(batch)
             
             # Register the batch as a temporary table
-            batch_name = f"tmp_batch_{i}"
+            batch_name = f"tmp_transactions_batch_{i}"
             conn.register(batch_name, df)
             
             # Insert the batch
@@ -244,13 +304,13 @@ def batch_insert_records(records: List[Dict], batch_size: int = 1000) -> None:
                 INSERT INTO raw.transactions (
                     transaction_id, group_id, date, cost, currency_code,
                     description, updated_at, created_at, is_payment,
-                    category_id, category_name, users_json,
+                    category_id, category_name,
                     version_start, version_end, is_current
                 )
                 SELECT
                     transaction_id, group_id, date, cost, currency_code,
                     description, updated_at, created_at, is_payment,
-                    category_id, category_name, users_json,
+                    category_id, category_name,
                     version_start, version_end, is_current
                 FROM {batch_name}
             """
@@ -259,15 +319,57 @@ def batch_insert_records(records: List[Dict], batch_size: int = 1000) -> None:
             batch_inserted = len(batch)
             total_inserted += batch_inserted
             
-            LOGGER.info("Inserted batch %d-%d (%d records)", 
+            LOGGER.info("Inserted transaction batch %d-%d (%d records)", 
                        i + 1, min(i + batch_size, len(records)), batch_inserted)
     
-    LOGGER.info("Total inserted: %d records", total_inserted)
+    LOGGER.info("Total transaction records inserted: %d", total_inserted)
+
+
+def batch_insert_user_payments(records: List[Dict], batch_size: int = 1000) -> None:
+    """Insert user payment records in batches."""
+    if not records:
+        LOGGER.info("No user payment records to insert")
+        return
+        
+    total_inserted = 0
+    
+    with get_db_connection() as conn:
+        for i in range(0, len(records), batch_size):
+            batch = records[i:i + batch_size]
+            df = pd.DataFrame(batch)
+            
+            # Register the batch as a temporary table
+            batch_name = f"tmp_payments_batch_{i}"
+            conn.register(batch_name, df)
+            
+            # Insert the batch
+            insert_query = f"""
+                INSERT INTO raw.user_payments (
+                    transaction_id, user_id, user_last_name,
+                    owed_share, paid_share, net_balance,
+                    version_start, version_end, is_current
+                )
+                SELECT
+                    transaction_id, user_id, user_last_name,
+                    owed_share, paid_share, net_balance,
+                    version_start, version_end, is_current
+                FROM {batch_name}
+            """
+            
+            conn.execute(insert_query)
+            batch_inserted = len(batch)
+            total_inserted += batch_inserted
+            
+            LOGGER.info("Inserted user payment batch %d-%d (%d records)", 
+                       i + 1, min(i + batch_size, len(records)), batch_inserted)
+    
+    LOGGER.info("Total user payment records inserted: %d", total_inserted)
 
 
 def apply_schema_and_insert_incremental(
     paths: Dict[str, Path],
-    records: List[Dict],
+    transaction_records: List[Dict],
+    user_payment_records: List[Dict],
     config: ETLConfig
 ) -> None:
     """Apply DDL and bulk-insert records with SCD Type 2 handling."""
@@ -281,16 +383,18 @@ def apply_schema_and_insert_incremental(
     schema_sql = schema_sql_path.read_text(encoding='utf-8')
     db_manager.execute_script(schema_sql)
     
-    if not records:
+    if not transaction_records and not user_payment_records:
         LOGGER.info("No records to process")
         return
     
     # Handle SCD Type 2 updates
-    transaction_ids = [r['transaction_id'] for r in records]
-    handle_updated_records(transaction_ids, db_path)
-    
-    # Insert new records in batches
-    batch_insert_records(records, config.batch_size)
+    if transaction_records:
+        transaction_ids = [r['transaction_id'] for r in transaction_records]
+        handle_updated_records(transaction_ids, db_path)
+        
+        # Insert new records in batches
+        batch_insert_transactions(transaction_records, config.batch_size)
+        batch_insert_user_payments(user_payment_records, config.batch_size)
 
 
 def fetch_and_normalize_expenses(
@@ -298,37 +402,60 @@ def fetch_and_normalize_expenses(
     group_id: int,
     since: Optional[str] = None,
     config: ETLConfig = None
-) -> List[Dict]:
-    """Retrieve expenses for group_id and normalize into list of dicts."""
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Retrieve expenses for group_id and normalize into transaction and user payment records.
+    
+    Returns:
+        Tuple of (transaction_records, user_payment_records)
+    """
     config = config or load_config()
     
     # Fetch raw expenses with retry logic
     raw_expenses = fetch_expenses_with_retry(client, group_id, since, config.api_timeout)
     
-    records: List[Dict] = []
+    transaction_records: List[Dict] = []
+    user_payment_records: List[Dict] = []
     validation_failures = 0
     
     for exp in raw_expenses:
         try:
-            # Normalize the expense record
-            record = normalize_expense_record(exp)
+            # Normalize the expense record into two record types
+            transaction_record, user_payments = normalize_expense_record(exp)
             
             # Validate if configured to do so
             if config.validate_data:
-                if not validate_expense_record(record):
+                # Validate transaction record
+                if not validate_transaction_record(transaction_record):
                     validation_failures += 1
                     continue
+                
+                # Validate user payment records
+                valid_user_payments = []
+                for user_payment in user_payments:
+                    if validate_user_payment_record(user_payment):
+                        valid_user_payments.append(user_payment)
+                    else:
+                        validation_failures += 1
+                
+                # Only add if we have valid user payments
+                if not valid_user_payments:
+                    validation_failures += 1
+                    continue
+                    
+                user_payments = valid_user_payments
             
-            records.append(record)
+            transaction_records.append(transaction_record)
+            user_payment_records.extend(user_payments)
             
         except Exception as e:
             LOGGER.error("Failed to process expense %s: %s", 
                         getattr(exp, 'getId', lambda: 'unknown')(), e)
             continue
     
-    LOGGER.info("Successfully processed %d expenses (%d validation failures)", 
-               len(records), validation_failures)
-    return records
+    LOGGER.info("Successfully processed %d transactions with %d user payments (%d validation failures)", 
+               len(transaction_records), len(user_payment_records), validation_failures)
+    return transaction_records, user_payment_records
 
 
 def extract_splitwise(
@@ -377,16 +504,17 @@ def extract_splitwise(
         LOGGER.info("Authenticated as %s", current_user.getFirstName())
         
         # Extract and transform
-        records = fetch_and_normalize_expenses(client, group_id, since, config)
+        transaction_records, user_payment_records = fetch_and_normalize_expenses(client, group_id, since, config)
         
-        if not records:
+        if not transaction_records:
             LOGGER.info("No new records to process")
             return
         
         # Load with SCD Type 2 handling
-        apply_schema_and_insert_incremental(paths, records, config)
+        apply_schema_and_insert_incremental(paths, transaction_records, user_payment_records, config)
         
-        LOGGER.info("Extraction completed successfully. Processed %d records", len(records))
+        LOGGER.info("Extraction completed successfully. Processed %d transactions and %d user payments", 
+                   len(transaction_records), len(user_payment_records))
         
     except Exception as e:
         LOGGER.error("Extraction failed: %s", e)
